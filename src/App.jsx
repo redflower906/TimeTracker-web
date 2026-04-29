@@ -13,6 +13,7 @@ import {
   addDoc,
   updateDoc,
   deleteDoc,
+  setDoc,
   query,
   orderBy,
   onSnapshot,
@@ -39,6 +40,8 @@ const TABS = [
   { id: "reports", label: "Reports", icon: "📊" },
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
+
+const ACTIVE_TIMER_LS_KEY = 'tt-active-timer';
 
 // ─── UTILITIES ──────────────────────────────────────────────────────
 function fmtDuration(seconds) {
@@ -80,12 +83,29 @@ function userCol(uid, name) {
   return collection(db, "users", uid, name);
 }
 
+function activeTimerDoc(uid) {
+  return doc(db, "users", uid, "meta", "activeTimer");
+}
+
 function toDateStr(val) {
   if (!val) return null;
   if (typeof val === "string") return val;
   if (val.toDate) return val.toDate().toISOString();
   if (val.seconds) return new Date(val.seconds * 1000).toISOString();
   return new Date(val).toISOString();
+}
+
+// Read active timer from localStorage synchronously (used at mount, before React renders)
+function readLocalActiveTimer() {
+  try {
+    const raw = localStorage.getItem(ACTIVE_TIMER_LS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.startTime) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 // ─── AUTH SCREEN ────────────────────────────────────────────────────
@@ -280,37 +300,97 @@ function MainApp({ user }) {
   const [entries, setEntries] = useState([]);
   const [loaded, setLoaded] = useState(false);
 
-  // Timer state
-  const [timerProject, setTimerProject] = useState("");
-  const [timerTask, setTimerTask] = useState("");
-  const [timerNotes, setTimerNotes] = useState("");
-  const [isRunning, setIsRunning] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
+  // ── Lazy-init timer state from localStorage so first render is correct (no flicker) ──
+  const initialTimer = readLocalActiveTimer();
+
+  const [isRunning, setIsRunning] = useState(!!initialTimer);
+  const [isPaused, setIsPaused] = useState(initialTimer?.isPaused ?? false);
+  const [startTime, setStartTime] = useState(initialTimer?.startTime ?? null);
+  const [pausedAt, setPausedAt] = useState(initialTimer?.pausedAt ?? null);
+  const [totalPausedMs, setTotalPausedMs] = useState(initialTimer?.totalPausedMs ?? 0);
   const [elapsed, setElapsed] = useState(0);
-  const [startTime, setStartTime] = useState(null);
   const timerRef = useRef(null);
+
+  // Timer fields. Initialized from localStorage if a timer was already running.
+  const [timerProject, setTimerProject] = useState(initialTimer?.projectId ?? "");
+  const [timerTask, setTimerTask] = useState(initialTimer?.taskId ?? "");
+  const [timerNotes, setTimerNotes] = useState(initialTimer?.notes ?? "");
+
+  // Prevents Firestore snapshot echo (after a local persist) from looping back into state updates
+  const skipNextPersist = useRef(false);
   const quickStartHandled = useRef(false);
+
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
 
-  // ── Quick-start: start unassigned timer via #start ──
+  // Compute elapsed from timestamps — single source of truth for display
+  const computeElapsed = useCallback(() => {
+    if (!startTime) return 0;
+    const startMs = new Date(startTime).getTime();
+    const nowMs = pausedAt ?? Date.now();
+    return Math.max(0, Math.floor((nowMs - startMs - totalPausedMs) / 1000));
+  }, [startTime, pausedAt, totalPausedMs]);
+
+  // ── Active timer persistence: localStorage (instant, survives tab eviction)
+  //    + Firestore (source of truth, syncs across devices) ──
+  const persistActiveTimer = useCallback(async (state) => {
+    // localStorage first — synchronous, can't fail in a way that blocks us
+    try {
+      if (state) {
+        localStorage.setItem(ACTIVE_TIMER_LS_KEY, JSON.stringify(state));
+      } else {
+        localStorage.removeItem(ACTIVE_TIMER_LS_KEY);
+      }
+    } catch (err) {
+      console.warn("localStorage write failed:", err);
+    }
+
+    // Firestore second — async, may fail offline (that's fine, localStorage has it)
+    try {
+      if (state) {
+        await setDoc(activeTimerDoc(user.uid), state);
+      } else {
+        await deleteDoc(activeTimerDoc(user.uid));
+      }
+    } catch (err) {
+      console.warn("Firestore activeTimer write failed:", err);
+    }
+  }, [user.uid]);
+
+  // ── Quick-start: start unassigned timer via /start ──
   useEffect(() => {
     if (!loaded || quickStartHandled.current) return;
-    if (QUICK_START) {
+    if (QUICK_START && !isRunning) {
       quickStartHandled.current = true;
-      if (!isRunning) {
-        setTimerProject("");
-        setTimerTask("");
-        setIsRunning(true);
-        setIsPaused(false);
-        setElapsed(0);
-        setStartTime(new Date().toISOString());
-        setTab("timer");
-      }
+      const newStart = new Date().toISOString();
+      setTimerProject("");
+      setTimerTask("");
+      setIsRunning(true);
+      setIsPaused(false);
+      setStartTime(newStart);
+      setPausedAt(null);
+      setTotalPausedMs(0);
+      setElapsed(0);
+      setTab("timer");
+
+      skipNextPersist.current = true;
+      persistActiveTimer({
+        startTime: newStart,
+        isPaused: false,
+        pausedAt: null,
+        totalPausedMs: 0,
+        projectId: "",
+        taskId: "",
+        notes: "",
+      });
+
       // Clear hash so refresh doesn't re-trigger
       window.history.replaceState({}, "", "/");
+    } else if (QUICK_START) {
+      quickStartHandled.current = true;
+      window.history.replaceState({}, "", "/");
     }
-  }, [loaded]);
+  }, [loaded, isRunning, persistActiveTimer]);
 
   // ── Realtime Firestore listeners ──
   useEffect(() => {
@@ -349,22 +429,79 @@ function MainApp({ user }) {
       }
     );
 
+    // Active timer document — keeps phone and laptop in sync
+    const unsubActiveTimer = onSnapshot(
+      activeTimerDoc(uid),
+      (snap) => {
+        // If this snapshot is the echo of our own write, ignore it
+        if (skipNextPersist.current) {
+          skipNextPersist.current = false;
+          return;
+        }
+        if (!snap.exists()) {
+          // Remote cleared the timer (e.g., stopped on another device)
+          setIsRunning(false);
+          setIsPaused(false);
+          setStartTime(null);
+          setPausedAt(null);
+          setTotalPausedMs(0);
+          setElapsed(0);
+          try { localStorage.removeItem(ACTIVE_TIMER_LS_KEY); } catch {}
+          return;
+        }
+        const data = snap.data();
+        setIsRunning(true);
+        setIsPaused(data.isPaused ?? false);
+        setStartTime(data.startTime ?? null);
+        setPausedAt(data.pausedAt ?? null);
+        setTotalPausedMs(data.totalPausedMs ?? 0);
+        setTimerProject(data.projectId ?? "");
+        setTimerTask(data.taskId ?? "");
+        setTimerNotes(data.notes ?? "");
+        try {
+          localStorage.setItem(ACTIVE_TIMER_LS_KEY, JSON.stringify(data));
+        } catch {}
+      }
+    );
+
     return () => {
       unsubProjects();
       unsubTasks();
       unsubEntries();
+      unsubActiveTimer();
     };
   }, [user.uid]);
 
-  // Timer interval
+  // ── Timer tick: derive elapsed from timestamps every second.
+  //    Also recompute on visibility change (handles iOS Safari throttling
+  //    when the screen turns off or the tab is backgrounded). ──
   useEffect(() => {
-    if (isRunning && !isPaused) {
-      timerRef.current = setInterval(() => setElapsed(e => e + 1), 1000);
-    } else {
+    if (!isRunning) {
       clearInterval(timerRef.current);
+      return;
     }
-    return () => clearInterval(timerRef.current);
-  }, [isRunning, isPaused]);
+
+    // Recompute immediately so display is correct on resume from background
+    setElapsed(computeElapsed());
+
+    if (!isPaused) {
+      timerRef.current = setInterval(() => {
+        setElapsed(computeElapsed());
+      }, 1000);
+    }
+
+    const onVisibility = () => {
+      if (!document.hidden) setElapsed(computeElapsed());
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", onVisibility);
+
+    return () => {
+      clearInterval(timerRef.current);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", onVisibility);
+    };
+  }, [isRunning, isPaused, computeElapsed]);
 
   // ── Firestore CRUD ──
   const addProject = async (name) => {
@@ -400,43 +537,104 @@ function MainApp({ user }) {
     await deleteDoc(doc(db, "users", user.uid, "timeEntries", id));
   };
 
+  // ── Timer handlers ──
   const handleStart = () => {
     if (!timerProject) return;
+    const newStart = new Date().toISOString();
     setIsRunning(true);
     setIsPaused(false);
+    setStartTime(newStart);
+    setPausedAt(null);
+    setTotalPausedMs(0);
     setElapsed(0);
-    setStartTime(new Date().toISOString());
+
+    skipNextPersist.current = true;
+    persistActiveTimer({
+      startTime: newStart,
+      isPaused: false,
+      pausedAt: null,
+      totalPausedMs: 0,
+      projectId: timerProject,
+      taskId: timerTask,
+      notes: timerNotes,
+    });
   };
 
-  const handlePause = () => setIsPaused(true);
-  const handleResume = () => setIsPaused(false);
+  const handlePause = () => {
+    const now = Date.now();
+    setIsPaused(true);
+    setPausedAt(now);
+
+    skipNextPersist.current = true;
+    persistActiveTimer({
+      startTime,
+      isPaused: true,
+      pausedAt: now,
+      totalPausedMs,
+      projectId: timerProject,
+      taskId: timerTask,
+      notes: timerNotes,
+    });
+  };
+
+  const handleResume = () => {
+    const newTotal = pausedAt ? totalPausedMs + (Date.now() - pausedAt) : totalPausedMs;
+    setTotalPausedMs(newTotal);
+    setPausedAt(null);
+    setIsPaused(false);
+
+    skipNextPersist.current = true;
+    persistActiveTimer({
+      startTime,
+      isPaused: false,
+      pausedAt: null,
+      totalPausedMs: newTotal,
+      projectId: timerProject,
+      taskId: timerTask,
+      notes: timerNotes,
+    });
+  };
 
   const handleStop = () => {
+    const finalPausedMs = pausedAt
+      ? totalPausedMs + (Date.now() - pausedAt)
+      : totalPausedMs;
+    const startMs = new Date(startTime).getTime();
+    const endMs = Date.now();
+    const finalDuration = Math.max(0, Math.floor((endMs - startMs - finalPausedMs) / 1000));
+
     const entry = {
       projectId: timerProject,
       taskId: timerTask,
       startTime: startTime,
-      endTime: new Date().toISOString(),
-      duration: elapsed,
+      endTime: new Date(endMs).toISOString(),
+      duration: finalDuration,
       notes: timerNotes,
     };
 
-    // If no project assigned, show the assign modal
+    // Stop the local clock
+    setIsRunning(false);
+    setIsPaused(false);
+    clearInterval(timerRef.current);
+
+    // Clear the persisted active timer immediately — no matter what comes next,
+    // there is no longer a running timer.
+    skipNextPersist.current = true;
+    persistActiveTimer(null);
+
+    // If no project assigned, show the assign modal (timer state stays around for the modal)
     if (!timerProject) {
       setPendingEntry(entry);
       setShowAssignModal(true);
-      setIsRunning(false);
-      setIsPaused(false);
-      clearInterval(timerRef.current);
       return;
     }
 
-    // Otherwise save directly
+    // Otherwise save directly and reset
     addEntry(entry);
-    setIsRunning(false);
-    setIsPaused(false);
     setElapsed(0);
     setStartTime(null);
+    setPausedAt(null);
+    setTotalPausedMs(0);
     setTimerNotes("");
   };
 
@@ -453,9 +651,12 @@ function MainApp({ user }) {
     setShowAssignModal(false);
     setElapsed(0);
     setStartTime(null);
+    setPausedAt(null);
+    setTotalPausedMs(0);
     setTimerNotes("");
     setTimerProject("");
     setTimerTask("");
+    // Active timer was already cleared in handleStop
   };
 
   const handleDiscardEntry = () => {
@@ -463,7 +664,10 @@ function MainApp({ user }) {
     setShowAssignModal(false);
     setElapsed(0);
     setStartTime(null);
+    setPausedAt(null);
+    setTotalPausedMs(0);
     setTimerNotes("");
+    // Active timer was already cleared in handleStop
   };
 
   const handleSignOut = async () => {
@@ -1265,7 +1469,7 @@ function SettingsScreen({ entries, projects, tasks, user, onSignOut }) {
       </div>
 
       <div style={{ textAlign: "center", padding: "24px 0 0", color: "var(--text3)", fontSize: 12 }}>
-        TimeTracker Web v1.1
+        TimeTracker Web v1.2
       </div>
     </div>
   );
